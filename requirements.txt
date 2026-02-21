@@ -1,0 +1,10 @@
+langchain-groq
+langchain-community
+langchain-core
+langgraph
+langgraph-checkpoint-postgres
+tavily-python
+python-dotenv
+psycopg[binary]
+flask
+flask-cors
