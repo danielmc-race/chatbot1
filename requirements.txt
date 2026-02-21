@@ -8,3 +8,6 @@ python-dotenv
 psycopg[binary]
 flask
 flask-cors
+bcrypt
+jwt
+gunicorn

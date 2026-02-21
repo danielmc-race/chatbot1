@@ -2,92 +2,67 @@ import os
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
-from typing import Annotated
-from langchain_groq import ChatGroq
-from langchain_community.tools.tavily_search import TavilySearchResults
-from langchain_core.messages import AnyMessage, SystemMessage, AIMessage
-from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
-from langgraph.checkpoint.postgres import PostgresSaver
-from langchain_core.messages import ToolMessage
-from typing_extensions import TypedDict
 from psycopg_pool import ConnectionPool
 import uuid
+from auth import token_required, hash_password, verify_password, generate_token
+from database import Database
+from agent import create_agent
 
-# Cargar variables de entorno
 load_dotenv()
 
-# --- Flask App ---
 app = Flask(__name__)
 CORS(app)
+app.config['SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'bc7d099cb5eacb2ea27a1e97af963a90fc8df843912f64f3ef1d904614494994')
 
-# --- Pool de conexiones PostgreSQL ---
 POSTGRES_URI = os.getenv("POSTGRES_URI")
 connection_pool = ConnectionPool(POSTGRES_URI, min_size=1, max_size=10)
-
-
-# --- Estado del agente ---
-class AgentState(TypedDict):
-    messages: Annotated[list[AnyMessage], add_messages]
-
-
-# --- Herramienta de búsqueda ---
-search_tool = TavilySearchResults(max_results=2)
-tools = [search_tool]
-
-# --- Modelo LLM ---
-llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
-llm_con_tools = llm.bind_tools(tools)
-
-
-# --- Nodos ---
-def nodo_agente(state: AgentState):
-    system = SystemMessage(
-        content="Eres un asistente útil. Usa la búsqueda web cuando necesites información actualizada.")
-    respuesta = llm_con_tools.invoke([system] + state["messages"])
-    return {"messages": [respuesta]}
-
-
-def nodo_herramientas(state: AgentState):
-    ultimo_mensaje = state["messages"][-1]
-    resultados = []
-    for tool_call in ultimo_mensaje.tool_calls:
-        tool = {tool.name: tool for tool in tools}[tool_call["name"]]
-        resultado = tool.invoke(tool_call["args"])
-        resultados.append(ToolMessage(content=str(resultado), tool_call_id=tool_call["id"]))
-    return {"messages": resultados}
-
-
-# --- Router ---
-def debe_continuar(state: AgentState) -> str:
-    ultimo_mensaje = state["messages"][-1]
-    if isinstance(ultimo_mensaje, AIMessage) and hasattr(ultimo_mensaje, "tool_calls") and ultimo_mensaje.tool_calls:
-        return "herramientas"
-    return END
-
-
-# --- Construir grafo ---
-graph = StateGraph(AgentState)
-graph.add_node("agente", nodo_agente)
-graph.add_node("herramientas", nodo_herramientas)
-graph.add_edge(START, "agente")
-graph.add_conditional_edges("agente", debe_continuar, {"herramientas": "herramientas", END: END})
-graph.add_edge("herramientas", "agente")
-
-# --- Compilar agente con memoria ---
-checkpointer = PostgresSaver(connection_pool)
-agent = graph.compile(checkpointer=checkpointer)
-
+db = Database(connection_pool)
+agent = create_agent(connection_pool)
 
 @app.route('/health', methods=['GET'])
 def health():
-    """Endpoint para verificar que la API está funcionando"""
     return jsonify({"status": "ok"})
 
+@app.route('/register', methods=['POST'])
+def register():
+    data = request.json
+    username = data.get('username')
+    email = data.get('email')
+    password = data.get('password')
+
+    if not username or not email or not password:
+        return jsonify({"error": "Username, email and password are required"}), 400
+
+    try:
+        password_hash = hash_password(password)
+        user_id = db.create_user(username, email, password_hash)
+        return jsonify({"message": "User created successfully", "user_id": user_id}), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.json
+    username = data.get('username')
+    password = data.get('password')
+
+    if not username or not password:
+        return jsonify({"error": "Username and password are required"}), 400
+
+    try:
+        user = db.get_user_by_username(username)
+
+        if not user or not verify_password(password, user[1]):
+            return jsonify({"error": "Invalid credentials"}), 401
+
+        token = generate_token(user[0], app.config['SECRET_KEY'])
+        return jsonify({"token": token}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/chat', methods=['POST'])
-def chat():
-    """Endpoint para enviar mensajes al chatbot"""
+@token_required
+def chat(current_user_id):
     data = request.json
     message = data.get('message')
     thread_id = data.get('thread_id', str(uuid.uuid4()))
@@ -104,7 +79,6 @@ def chat():
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
